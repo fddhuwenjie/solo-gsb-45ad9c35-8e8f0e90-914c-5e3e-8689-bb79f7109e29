@@ -53,6 +53,17 @@ from .overlay import (
     NoMatchError,
     apply_overlay,
 )
+from .security import (
+    InvalidDocumentError as InvalidSecurityDocumentError,
+)
+from .security import (
+    InvalidSecurityRequestError,
+    InvalidSelectorError as InvalidSecuritySelectorError,
+)
+from .security import (
+    SecurityPlanningError,
+    plan_security,
+)
 from .slicer import (
     InvalidDocumentError,
     InvalidSelectorError,
@@ -115,7 +126,20 @@ app = FastAPI(
         "missing values, illegal expressions, non-scalar interpolation and "
         "dangling, external or circular references return 422 with the "
         "source JSON Pointers of the callback and the expression. Results "
-        "are stably sorted by source and the input is never modified."
+        "are stably sorted by source and the input is never modified. "
+        "POST /security/plan plans the security injection for one protected "
+        "operation: it receives the OpenAPI document, one operation "
+        "selector and the already-available scheme names with their granted "
+        "scopes (never any secret value), honors operation-level security "
+        "overriding root-level security (array items OR, schemes within an "
+        "item AND, security: [] anonymous), cycle-safely resolves local "
+        "Security Scheme $refs and validates apiKey/http/oauth2/"
+        "openIdConnect definitions and scopes; it returns the satisfiable "
+        "alternative with the fewest schemes (ties by canonical JSON), the "
+        "header/query/cookie/Authorization injection instructions and the "
+        "source JSON Pointers, or 200 with every alternative's missing "
+        "scheme/scope when nothing is satisfiable. Dangling, external or "
+        "illegal definitions return 422 and secrets are never echoed."
     ),
 )
 
@@ -365,6 +389,156 @@ class ResolvedCallbackModel(BaseModel):
         ),
     )
 
+
+class SecurityPlanRequest(BaseModel):
+    document: Dict[str, Any] = Field(
+        ..., description="The OpenAPI 3.x JSON document declaring the operation."
+    )
+    selector: str = Field(
+        ...,
+        description=(
+            "The operation whose security is planned, in the 'METHOD /path' "
+            "form (e.g. 'GET /pets/{petId}'); method is case-insensitive."
+        ),
+    )
+    available: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description=(
+            "The security schemes the client already has available, keyed by "
+            "the exact scheme name declared in components/securitySchemes; "
+            "each value is the list of granted OAuth/OIDC scope name strings "
+            "(empty for apiKey/http schemes). Only names and scopes are "
+            "exchanged: secret values (tokens, passwords, API keys) must "
+            "never be sent and any such request field is rejected."
+        ),
+    )
+
+
+class SecurityInjectModel(BaseModel):
+    location: Literal["header", "query", "cookie", "authorization"] = Field(
+        ...,
+        description=(
+            "Where the credential is injected at runtime: a named header, "
+            "query parameter or cookie, or the HTTP 'Authorization' header."
+        ),
+    )
+    name: str = Field(
+        ...,
+        description=(
+            "The header name, query parameter name or cookie name; always "
+            "'Authorization' when location is 'authorization'."
+        ),
+    )
+    http_scheme: Optional[str] = Field(
+        default=None,
+        description=(
+            "The HTTP authentication scheme token for Authorization "
+            "injection (e.g. 'basic', 'bearer'); absent for apiKey schemes."
+        ),
+    )
+    description: str = Field(..., description="Human-readable injection instruction.")
+
+
+class PlannedSchemeModel(BaseModel):
+    name: str = Field(..., description="The selected security scheme name.")
+    type: Literal["apiKey", "http", "oauth2", "openIdConnect"]
+    required_scopes: List[str] = Field(
+        ...,
+        description="Scopes the operation requires from this scheme (sorted).",
+    )
+    granted_scopes: List[str] = Field(
+        ...,
+        description="Scopes the client has granted (oauth2/openIdConnect, sorted).",
+    )
+    scheme_pointer: str = Field(
+        ...,
+        description="JSON Pointer of the Security Scheme Object definition.",
+    )
+    requirement_pointer: str = Field(
+        ...,
+        description="JSON Pointer of the scheme entry in the chosen security item.",
+    )
+    inject: SecurityInjectModel = Field(
+        ..., description="Where and how to inject the scheme credential."
+    )
+
+
+class SelectedRequirementModel(BaseModel):
+    item_index: int = Field(
+        ..., description="Index of the chosen item in the effective security array."
+    )
+    item_pointer: str = Field(
+        ..., description="JSON Pointer of the chosen security requirement item."
+    )
+    schemes: List[PlannedSchemeModel] = Field(
+        ..., description="All schemes that must be supplied together (AND), sorted by name."
+    )
+
+
+class MissingRequirementModel(BaseModel):
+    kind: Literal["scheme", "scope"] = Field(
+        ..., description="'scheme' when no credential is available, else a missing scope."
+    )
+    scheme: str = Field(..., description="The referenced security scheme name.")
+    scope: Optional[str] = Field(
+        default=None, description="The missing scope name for kind='scope'."
+    )
+    reason: str = Field(..., description="Human-readable explanation.")
+
+
+class SecurityAlternativeModel(BaseModel):
+    item_index: int = Field(
+        ..., description="Index of this item in the effective security array."
+    )
+    item_pointer: str = Field(
+        ..., description="JSON Pointer of the security requirement item."
+    )
+    satisfiable: bool = Field(
+        ..., description="Whether the 'available' envelope satisfies this item."
+    )
+    schemes: List[str] = Field(
+        ..., description="Scheme names in this item (AND), sorted."
+    )
+    missing: List[MissingRequirementModel] = Field(
+        ..., description="Schemes or scopes missing for this item, stably sorted."
+    )
+
+
+class SecurityPlanResponse(BaseModel):
+    selector: str = Field(..., description="Echoed normalized 'METHOD /path' selector.")
+    security_source: Literal["operation", "root", "none"] = Field(
+        ...,
+        description=(
+            "Where the effective security array came from: the operation, "
+            "the root-level default, or absent altogether."
+        ),
+    )
+    anonymous: bool = Field(
+        ...,
+        description=(
+            "True when the effective security is an empty array (or absent): "
+            "no credential is required."
+        ),
+    )
+    satisfiable: bool = Field(
+        ..., description="Whether at least one alternative is satisfiable."
+    )
+    selected: Optional[SelectedRequirementModel] = Field(
+        ...,
+        description=(
+            "The chosen alternative (fewest schemes, ties by canonical JSON); "
+            "null when anonymous or nothing is satisfiable."
+        ),
+    )
+    alternatives: List[SecurityAlternativeModel] = Field(
+        ...,
+        description=(
+            "Every effective security item with its satisfiability and "
+            "missing schemes/scopes; empty for anonymous operations."
+        ),
+    )
+
+
 class ExampleErrorModel(BaseModel):
     side: Literal["request", "response"] = Field(
         ..., description="Whether the example belongs to a requestBody or a response."
@@ -480,6 +654,7 @@ def root() -> Dict[str, str]:
         "overlay_apply": "POST /overlay/apply",
         "requests_materialize": "POST /requests/materialize",
         "callbacks_resolve": "POST /callbacks/resolve",
+        "security_plan": "POST /security/plan",
     }
 
 
@@ -900,3 +1075,102 @@ def callbacks_resolve(payload: CallbackResolveRequest) -> JSONResponse:
             for item in resolved
         ],
     )
+
+
+@app.post(
+    "/security/plan",
+    response_model=SecurityPlanResponse,
+    responses={
+        400: {
+            "description": "The document is not OpenAPI 3.x, the selector "
+            "is malformed/unknown, the available envelope is malformed, or "
+            "the request carries secret material"
+        },
+        422: {
+            "description": "A security requirement/definition is invalid: "
+            "malformed security array, an unknown scheme, a dangling, "
+            "external or circular Security Scheme $ref, an illegal "
+            "apiKey/http/oauth2/openIdConnect definition, scopes on a "
+            "non-OAuth scheme, or an oauth2 scope not declared by any flow"
+        },
+    },
+    summary="Plan the security injection for one protected operation",
+)
+def security_plan(payload: Dict[str, Any]) -> JSONResponse:
+    try:
+        plan = plan_security(payload)
+    except InvalidSecurityDocumentError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_openapi_document",
+                "messages": exc.messages,
+            },
+        )
+    except InvalidSecuritySelectorError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_selector", "messages": exc.messages},
+        )
+    except InvalidSecurityRequestError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_security_request",
+                "messages": exc.messages,
+            },
+        )
+    except SecurityPlanningError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "security_planning_failed",
+                "message": (
+                    "the security requirements could not be planned; fix the "
+                    "reported definitions, references or scope declarations "
+                    "first"
+                ),
+                "errors": exc.errors,
+            },
+        )
+    return JSONResponse(status_code=200, content=plan)
+
+
+def _custom_openapi() -> Dict[str, Any]:
+    """Augment the generated schema with the raw-dict request body."""
+    from fastapi.openapi.utils import get_openapi
+
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    # The /security/plan handler accepts a raw dict body so it can reject
+    # secret-bearing and malformed envelopes with the service's own 400
+    # errors; register its request model and wire it into the operation.
+    request_schema = SecurityPlanRequest.model_json_schema(
+        ref_template="#/components/schemas/{model}"
+    )
+    defs = request_schema.pop("$defs", {})
+    components = schema.setdefault("components", {}).setdefault("schemas", {})
+    components[SecurityPlanRequest.__name__] = request_schema
+    components.update(defs)
+    operation = schema["paths"]["/security/plan"]["post"]
+    operation["requestBody"] = {
+        "required": True,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "$ref": f"#/components/schemas/{SecurityPlanRequest.__name__}"
+                }
+            }
+        },
+    }
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _custom_openapi  # type: ignore[assignment]
