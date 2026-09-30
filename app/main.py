@@ -59,6 +59,17 @@ from .slicer import (
     SliceReferenceError,
     slice_document,
 )
+from .security import (
+    InvalidDocumentError as InvalidSecurityDocumentError,
+)
+from .security import (
+    InvalidGrantError,
+    InvalidSelectorError as InvalidSecuritySelectorError,
+)
+from .security import (
+    SecurityDefinitionError,
+    plan_security,
+)
 
 app = FastAPI(
     title="OpenAPI Contract Compatibility Audit API",
@@ -115,7 +126,21 @@ app = FastAPI(
         "missing values, illegal expressions, non-scalar interpolation and "
         "dangling, external or circular references return 422 with the "
         "source JSON Pointers of the callback and the expression. Results "
-        "are stably sorted by source and the input is never modified."
+        "are stably sorted by source and the input is never modified. "
+        "POST /security/plan plans how to authenticate one protected "
+        "operation for joint debugging: it resolves the effective "
+        "operation-level security (overriding the root array; requirement "
+        "items are OR alternatives, schemes within one item are AND, and "
+        "'security: []' means anonymous), cycle-safely resolves local "
+        "Security Scheme Object $refs and validates apiKey/http/oauth2/"
+        "openIdConnect definitions plus the required scopes against the "
+        "caller's granted credential inventory (scheme names + scopes only, "
+        "never secrets). It chooses the satisfiable alternative needing the "
+        "fewest schemes (canonical JSON tie-break) and reports where each "
+        "credential is injected (header/query/cookie/Authorization) with "
+        "source JSON Pointers; unsatisfiable operations still return 200 "
+        "with every missing scheme/scope, while dangling/external "
+        "references and illegal definitions return 422."
     ),
 )
 
@@ -365,6 +390,130 @@ class ResolvedCallbackModel(BaseModel):
         ),
     )
 
+class SecurityPlanRequest(BaseModel):
+    document: Dict[str, Any] = Field(
+        ..., description="The OpenAPI 3.x JSON document declaring the operation."
+    )
+    selector: str = Field(
+        ...,
+        description=(
+            "The protected operation to plan, in the 'METHOD /path' form "
+            "(e.g. 'GET /pets/{petId}'); method is case-insensitive."
+        ),
+    )
+    granted: Optional[Any] = Field(
+        default=None,
+        description=(
+            "Available credential inventory only: an object mapping each "
+            "granted security scheme name to its granted scope name strings "
+            "(use [] for scope-less schemes such as apiKey/http). Do NOT "
+            "send secret values (tokens, passwords, API keys): the service "
+            "neither needs nor stores them. Unknown scheme names are "
+            "ignored."
+        ),
+    )
+
+
+class SecuritySchemePlanModel(BaseModel):
+    scheme: str = Field(..., description="The security scheme name.")
+    type: Literal["apiKey", "http", "oauth2", "openIdConnect"]
+    required_scopes: List[str] = Field(
+        ..., description="Scopes the requirement demands from this scheme."
+    )
+    injection: str = Field(
+        ...,
+        description=(
+            "Human-readable description of where the credential is injected "
+            "(HTTP header incl. Authorization, query parameter or cookie) "
+            "and in what wire format. No secret values are included."
+        ),
+    )
+    location: Optional[str] = Field(
+        default=None,
+        description=(
+            "'header' / 'query' / 'cookie' injection location; every "
+            "supported scheme type injects an HTTP credential."
+        ),
+    )
+    parameter_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "The header / query / cookie parameter name carrying the "
+            "credential ('Authorization' for http/oauth2/openIdConnect, the "
+            "declared apiKey name otherwise)."
+        ),
+    )
+    http_scheme: Optional[str] = Field(
+        default=None,
+        description="The declared HTTP Authentication scheme for type 'http'.",
+    )
+    requirement_pointer: str = Field(
+        ...,
+        description=(
+            "JSON Pointer of the Security Requirement Object item that "
+            "names this scheme."
+        ),
+    )
+    source_pointer: str = Field(
+        ...,
+        description="JSON Pointer of the Security Scheme Object definition.",
+    )
+
+
+class SecurityAlternativeModel(BaseModel):
+    requirement: Dict[str, List[str]] = Field(
+        ...,
+        description=(
+            "The Security Requirement Object exactly as declared (schemes "
+            "inside must all be satisfied: AND)."
+        ),
+    )
+    requirement_pointer: Optional[str] = Field(
+        ..., description="JSON Pointer of the requirement array item."
+    )
+    satisfiable: bool
+    scheme_count: int
+    plan: List[SecuritySchemePlanModel]
+    missing: List[Dict[str, Any]] = Field(
+        ...,
+        description=(
+            "Why this alternative cannot be satisfied: missing credentials "
+            "and missing scopes, each with the scheme name and source "
+            "pointers. Empty when satisfiable."
+        ),
+    )
+
+
+class SecurityPlanResponse(BaseModel):
+    operation_pointer: str = Field(
+        ..., description="JSON Pointer of the selected operation."
+    )
+    security_pointer: Optional[str] = Field(
+        ...,
+        description=(
+            "JSON Pointer of the effective security array (the operation "
+            "member or the root member); null when no requirement exists."
+        ),
+    )
+    inherited: bool = Field(
+        ...,
+        description="True when the operation inherits the root-level array.",
+    )
+    anonymous: bool = Field(..., description="True for 'security: []' / no requirement.")
+    satisfiable: bool
+    selected: Optional[Dict[str, Any]] = Field(
+        ...,
+        description=(
+            "The chosen alternative (fewest schemes, canonical JSON "
+            "tie-break) with its injection plan; null when nothing is "
+            "satisfiable; an empty-plan object for the anonymous case."
+        ),
+    )
+    alternatives: List[SecurityAlternativeModel] = Field(
+        ..., description="Per-alternative evaluation, in declaration order."
+    )
+
+
 class ExampleErrorModel(BaseModel):
     side: Literal["request", "response"] = Field(
         ..., description="Whether the example belongs to a requestBody or a response."
@@ -480,6 +629,7 @@ def root() -> Dict[str, str]:
         "overlay_apply": "POST /overlay/apply",
         "requests_materialize": "POST /requests/materialize",
         "callbacks_resolve": "POST /callbacks/resolve",
+        "security_plan": "POST /security/plan",
     }
 
 
@@ -900,3 +1050,61 @@ def callbacks_resolve(payload: CallbackResolveRequest) -> JSONResponse:
             for item in resolved
         ],
     )
+
+
+@app.post(
+    "/security/plan",
+    response_model=SecurityPlanResponse,
+    responses={
+        400: {
+            "description": "The document is not OpenAPI 3.x, the selector "
+            "is malformed/unknown, or the granted credential envelope is "
+            "malformed"
+        },
+        422: {
+            "description": "A Security Requirement references an undefined, "
+            "dangling, external or circular Security Scheme Object, or an "
+            "apiKey/http/oauth2/openIdConnect definition (incl. required "
+            "scopes) is illegal; each error carries its source JSON Pointer"
+        },
+    },
+    summary="Plan how to authenticate one protected operation",
+)
+def security_plan(payload: SecurityPlanRequest) -> JSONResponse:
+    try:
+        result = plan_security(
+            payload.document, payload.selector, payload.granted
+        )
+    except InvalidSecurityDocumentError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_openapi_document",
+                "messages": exc.messages,
+            },
+        )
+    except InvalidSecuritySelectorError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_selector", "messages": exc.messages},
+        )
+    except InvalidGrantError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_granted_credentials", "messages": exc.messages},
+        )
+    except SecurityDefinitionError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "invalid_security_definition",
+                "message": (
+                    "one or more security requirements reference illegal, "
+                    "dangling, external or circular security scheme "
+                    "definitions; fix the contract before a plan can be "
+                    "produced"
+                ),
+                "errors": exc.errors,
+            },
+        )
+    return JSONResponse(status_code=200, content=result)

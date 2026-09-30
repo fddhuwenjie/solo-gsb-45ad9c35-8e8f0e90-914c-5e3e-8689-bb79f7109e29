@@ -1,6 +1,6 @@
 # OpenAPI 契约兼容性审计 API
 
-用 Python + FastAPI 实现的 OpenAPI 3.x 契约服务，提供七个接口：
+用 Python + FastAPI 实现的 OpenAPI 3.x 契约服务，提供八个接口：
 
 - **`POST /audit`**：提交**基线版**与**候选版**两份 OpenAPI 3.x JSON 文档，服务会解析本地 `$ref`（循环安全），并按以下策略判定候选版是否向后兼容：
 
@@ -57,6 +57,21 @@
   悬空 / 外部 / 循环引用一律返回 **422**，逐条给出**回调与表达式的来源 JSON Pointer**；
   结果按来源稳定排序，且不修改输入文档与上下文。
 
+- **`POST /security/plan`**：为**联调受保护操作**规划鉴权方式。提交**一份** OpenAPI 3.x
+  文档、一个 `METHOD /path` 操作选择器与**可用凭证清单**（已具备的方案名与已授予 scope
+  名字，**绝不接收任何秘密值**——token / 密码 / API Key 都不需要、也不会回显）。服务取
+  操作的**有效 `security`**：操作级数组**整体覆盖**根级数组，数组各项之间是 **OR**（任一
+  满足即可）、同一项内的多个方案是 **AND**（必须全部具备），显式 `security: []` 表示
+  **匿名**。本地 Security Scheme `$ref` 链（含 OpenAPI 3.1 同级字段）循环安全解析，
+  并按规范校验 **apiKey / http / oauth2 / openIdConnect** 定义（apiKey 的 `name`+`in`、
+  http 的 `scheme`、oauth2 各 flow 的 URL 与 `scopes`、openIdConnect 的
+  `openIdConnectUrl`）以及要求的 scope（apiKey/http 不得带 scope，oauth2 只能要求已由
+  某个 flow 声明的 scope）。在所有**可满足项**中选择**所需方案数最少**的一项，同数时按
+  方案要求对象的**规范 JSON 排序**（键名升序）决胜。返回所选项、每个凭证注入 **header /
+  query / cookie 或 `Authorization`** 的位置与线格式说明，以及方案定义与 requirement 的
+  **来源 JSON Pointer**。**没有任何可满足项仍返回 200**，逐项列出缺少的方案或 scope；
+  悬空 / 外部 / 循环引用、未定义方案名与非法定义返回 **422**，错误均不包含秘密值。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件）。在项目根目录执行：
@@ -77,6 +92,7 @@ docker compose up --build
 | 覆盖动作接口 | `POST http://localhost:8080/overlay/apply` |
 | 请求物化接口 | `POST http://localhost:8080/requests/materialize` |
 | 回调解析接口 | `POST http://localhost:8080/callbacks/resolve` |
+| 安全方案规划接口 | `POST http://localhost:8080/security/plan` |
 | 交互式 API 文档（Swagger UI） | http://localhost:8080/docs |
 | OpenAPI 描述文档 | http://localhost:8080/openapi.json |
 
@@ -929,6 +945,198 @@ curl -s -X POST http://localhost:8080/callbacks/resolve \
 > 错误会一次报齐。循环安全仅作用于回调与 Path Item 层的 `$ref` 链，Path Item 内部的
 > 递归 schema 引用随 Path Item 原样返回，不会阻塞解析。
 
+## `POST /security/plan`：为受保护操作规划鉴权方案
+
+用于**联调前确认“该往请求里注入什么凭证”**：给定一份 OpenAPI 3.x 文档、一个操作选择器
+和调用方**当前具备的方案与 scope 清单**，服务判定操作能否在当前凭证下通过鉴权，并给出
+每个凭证注入 HTTP 请求的**位置与格式**及契约中的**来源 JSON Pointer**。
+
+> **不接收秘密值**：`granted` 只声明“有没有某个方案的凭证”和“token 被授予了哪些
+> scope 名”。实际的 API Key、密码、Bearer token 等秘密**绝不出现在请求中**；服务端
+> 不需要也不会存储、回显它们（200 / 400 / 422 任何响应体都不含请求里的秘密字符串）。
+
+### 有效 `security` 的取得与 OR / AND 语义
+
+- 操作对象上声明了 `security` 时，**整体替换**根级 `security`（不是数组合并）；操作未
+  声明时继承根级。根级与操作级都没有时，操作视为**匿名**。
+- 显式 **`security: []`**（无论在根级还是操作级）表示**匿名访问**，返回
+  `anonymous: true` 与空计划。
+- `security` 是**Security Requirement Object 数组**：
+  - **数组各项之间是 OR**——满足任意一项即可通过鉴权，服务对每项分别给出
+    `satisfiable` 与缺失清单；
+  - **同一项内的多个方案是 AND**——该项要求的所有方案（含各自 scope）必须同时具备。
+- 服务在所有可满足项中选择**所需方案数最少**的一项；方案数相同时，按该 requirement
+  对象的**规范 JSON**（键名升序、紧凑分隔符的 UTF-8 编码）字典序决胜；再相同取声明在前
+  的一项。所选项放在 `selected`，全部逐项评估放在 `alternatives`（按声明顺序）。
+
+### 方案定义与 scope 校验
+
+Security Scheme Object 可以内联在 `components/securitySchemes`，也可以是本地 `$ref`
+（仅支持 `#/...`）。`$ref` 链**循环安全**解析（多跳链跟随到终点，记录已访问目标，
+成环或超过 100 跳均 422）；**OpenAPI 3.1** 下 `$ref` 同级字段逐层合并（近者优先），
+**OpenAPI 3.0** 下严格忽略同级字段。按规范校验：
+
+| type | 必填 / 校验 | 注入位置 |
+| --- | --- | --- |
+| `apiKey` | 非空字符串 `name`，且 `in` ∈ `header` / `query` / `cookie` | 具名 header / 查询参数 / Cookie（`name=<key>` 进 Cookie 头） |
+| `http` | 非空字符串 `scheme`（HTTP 认证方案，如 `basic` / `bearer`）；`bearerFormat` 若有须为字符串 | `Authorization` 头（`Basic …` / `Bearer <token>` / `<scheme> <token>`） |
+| `oauth2` | 对象 `flows`，至少含一个 flow；`implicit` 须有 `authorizationUrl`，`password` / `clientCredentials` 须有 `tokenUrl`，`authorizationCode` 两者皆须；每个 flow 的 `scopes` 须为 scope 名 → 描述字符串的对象 | `Authorization: Bearer <token>` |
+| `openIdConnect` | 非空字符串 `openIdConnectUrl`（发现地址，不发起网络请求） | `Authorization: Bearer <token>` |
+
+requirement 中的 scope 数组同样校验：必须是字符串数组；**apiKey / http 只能用空数组**
+（这两类方案没有 scope 概念）；**oauth2 要求的每个 scope 必须已由某个 flow 的
+`scopes` 声明**；openIdConnect 的 scope 在发现期才确定，不做枚举校验。
+
+### 请求
+
+```bash
+curl -s -X POST http://localhost:8080/security/plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "document": { "openapi": "3.0.3", "info": {"title": "Pet API", "version": "1.0"},
+                  "paths": {"...": {}} },
+    "selector": "POST /pets",
+    "granted": {"oauth": ["pets:write"], "partnerKey": []}
+  }'
+```
+
+- `document`：一份 OpenAPI 3.x JSON 文档（对象）。
+- `selector`：形如 `METHOD /path` 的单个选择器（方法大小写不敏感，路径须逐字匹配；
+  OpenAPI 3.1 path-level `$ref` 提供的方法同样认可）。
+- `granted`（可省略，默认 `{}`）：方案名 → **已授予 scope 名字符串数组**；apiKey /
+  http 这类无 scope 方案用空数组 `[]` 表示“凭证在手”。数组里的 scope 会去重，键序不
+  影响结果。列出文档中不存在的方案名不报错（只是用不上）。
+
+### 成功响应（`200`，无可满足项时也仍然是 200）
+
+```json
+{
+  "operation_pointer": "/paths/~1pets/post",
+  "security_pointer": "/paths/~1pets/post/security",
+  "inherited": false,
+  "anonymous": false,
+  "satisfiable": true,
+  "selected": {
+    "requirement": {"oauth": ["pets:write"]},
+    "requirement_pointer": "/paths/~1pets/post/security/1",
+    "scheme_count": 1,
+    "plan": [
+      {
+        "scheme": "oauth",
+        "type": "oauth2",
+        "required_scopes": ["pets:write"],
+        "injection": "send the OAuth 2.0 access token in the 'Authorization' header as 'Bearer <token>' carrying the required scopes",
+        "location": "header",
+        "parameter_name": "Authorization",
+        "requirement_pointer": "/paths/~1pets/post/security/1",
+        "source_pointer": "/components/securitySchemes/oauth"
+      }
+    ]
+  },
+  "alternatives": [
+    {
+      "requirement": {"partnerKey": []},
+      "requirement_pointer": "/paths/~1pets/post/security/0",
+      "satisfiable": false,
+      "scheme_count": 1,
+      "plan": [
+        {
+          "scheme": "partnerKey",
+          "type": "apiKey",
+          "required_scopes": [],
+          "injection": "send the API key in the HTTP header 'X-Partner-Key'",
+          "location": "header",
+          "parameter_name": "X-Partner-Key",
+          "requirement_pointer": "/paths/~1pets/post/security/0",
+          "source_pointer": "/components/securitySchemes/partnerKey"
+        }
+      ],
+      "missing": [
+        {
+          "scheme": "partnerKey",
+          "type": "apiKey",
+          "source_pointer": "/components/securitySchemes/partnerKey",
+          "requirement_pointer": "/paths/~1pets/post/security/0",
+          "error": "no credential granted for security scheme 'partnerKey' (apiKey)"
+        }
+      ]
+    }
+  ]
+}
+```
+
+字段说明：
+
+- `security_pointer`：生效 `security` 数组的来源 Pointer——继承根级时为 `/security`，
+  操作自带时指向 `/paths/.../<method>/security`；根级与操作级都没有时为 `null`。
+- `selected.plan[].injection`：凭证注入说明（英文稳定文案），明确 header / query /
+  cookie 位置与线格式；占位符（`<key>` / `<token>`）表示**由联调方在请求时填入秘密
+  值**，服务本身不接触秘密。
+- `selected.plan[].source_pointer`：`$ref` 链**终点**的方案定义位置（修复定义问题的
+  稳定位置）；`requirement_pointer` 指向引用该方案的 requirement 数组项。
+- 匿名操作的 `selected` 为 `{requirement: {}, requirement_pointer: null,
+  scheme_count: 0, plan: []}`。
+- **无可满足项**：HTTP 状态仍是 **200**，`satisfiable: false`、`selected: null`，
+  `alternatives[*].missing` 逐项列出缺什么：
+
+```json
+{
+  "scheme": "oauth",
+  "type": "oauth2",
+  "scope": "pets:admin",
+  "source_pointer": "/components/securitySchemes/oauth",
+  "requirement_pointer": "/paths/~1pets/post/security/0/oauth",
+  "error": "granted credential for 'oauth' is missing the required scope 'pets:admin'"
+}
+```
+
+  “根本没有该方案的凭证”与“有凭证但缺 scope”分别报告（后者带 `scope`），同一
+  requirement 内的多条缺失一次列齐并按 `(scheme, scope, error)` 稳定排序。
+
+### 错误响应
+
+- `400 invalid_openapi_document`：`document` 缺少 `openapi: 3.x` 或 `paths` 对象。
+- `400 invalid_selector`：选择器不是 `METHOD /path` 形态，或路径 / 方法不存在。
+- `400 invalid_granted_credentials`：`granted` 不是对象、方案名不是非空字符串，或某个
+  值不是 scope 名字符串数组（apiKey/http 应给 `[]`，不要放 token 字符串）。
+- `422 invalid_security_definition` / `unresolvable_reference`：契约层面的结构问题，
+  `errors` 每条带 `code`、来源 `pointer`（必要时附 `ref`）与原因，**全部问题一次报齐、
+  按 `(code, pointer, ref, error)` 稳定排序**，包括：
+
+  - requirement 项不是对象、scope 值不是字符串数组、`security` 不是数组、方案节点不是对象；
+  - requirement 引用了 `components/securitySchemes` 中不存在的方案名（422，pointer 指向
+    requirement 中的方案名位置）；
+  - 方案 `$ref` **悬空 / 外部（`http(s)://`、文件路径等）/ 指向根 `#` / 目标非对象 /
+    循环 / 超深链**（pointer 指向出问题的 `$ref` 出现处，并附 `ref`）；
+  - 非法 type，apiKey 缺 `name` 或 `in` 非法，http 缺 `scheme`，oauth2 缺 flow / flow
+    URL / `scopes` 映射非法，openIdConnect 缺 `openIdConnectUrl`；
+  - apiKey/http 的 requirement 带了 scope，或 oauth2 要求了未在任何 flow 中声明的 scope。
+
+```json
+{
+  "error": "invalid_security_definition",
+  "message": "one or more security requirements reference illegal, dangling, external or circular security scheme definitions; fix the contract before a plan can be produced",
+  "errors": [
+    {
+      "code": "invalid_security_definition",
+      "pointer": "/components/securitySchemes/oauth/flows/implicit/authorizationUrl",
+      "error": "the 'implicit' oauth2 flow requires a non-empty string 'authorizationUrl'"
+    },
+    {
+      "code": "unresolvable_reference",
+      "pointer": "/components/securitySchemes/partnerKey",
+      "ref": "#/components/securitySchemes/Missing",
+      "error": "unresolvable reference '#/components/securitySchemes/Missing': object has no property 'Missing'"
+    }
+  ]
+}
+```
+
+> 400 与 422 的边界：文档形态、选择器与 `granted` 信封问题是请求错误（400）；文档确实
+> 选中了操作、但其安全定义 / 引用本身非法是契约错误（422）。未被选中操作的安全定义不
+> 会被访问，因而不影响本次规划。规划过程**不会修改**请求中的任何对象，输出与输入键序、
+> scope 顺序无关。
+
 ## 检查的变更类别
 
 | category | 说明 | 判定为 breaking 的方向 |
@@ -1040,7 +1248,20 @@ path-level 与 operation-level 参数合并（后者按 `(in, name)` 覆盖、
 Callback Object 与 Path Item 本地 `$ref` 解析（多跳、3.1 同级覆盖与 3.0 忽略同级、
 表达式 Pointer 跟随到组件）、悬空 / 外部 / 非对象 / 循环引用 422（含回调与表达式
 来源 Pointer、path-level `$ref`、根引用 `#` 拒绝）、400 文档 / 选择器 / context 信封边界、
-无 callbacks 返回空列表、多错误齐报与输入对象不被修改等共 385 个用例。
+无 callbacks 返回空列表、多错误齐报与输入对象不被修改；
+以及 `/security/plan` 的匿名（操作 `security: []`、根 `security: []`、完全无声明）、
+根级继承与操作级整体覆盖、OR 多项与项内 AND、最少方案选择与规范 JSON 决胜
+（含输入键序无关）、AND 计划按方案名排序、apiKey header/query/cookie、
+http basic/bearer（含 bearerFormat）/其他 scheme、oauth2 与 openIdConnect 的
+`Authorization: Bearer` 注入位置与来源 Pointer、oauth2 scope 满足 / 缺失 /
+无凭证区分、openIdConnect scope 不枚举校验、Security Scheme 本地 `$ref`（单跳 /
+多跳、3.0 忽略同级与 3.1 同级覆盖、循环 / 外部 / 悬空 / 根引用 / 目标非对象 422）、
+未定义方案名与缺失 securitySchemes、非法 type、apiKey/http/oauth2/openIdConnect
+定义校验（含各 flow URL 与 scopes、至少一个 flow）、scope 与方案类型一致性、
+`security` / requirement / scope 容器形态错误、多错误齐报稳定排序、
+无可满足项仍 200 且逐项列出缺失方案与 scope、400 文档 / 选择器 / granted 信封边界、
+3.1 path-level `$ref` 提供操作、路径 token 的 RFC 6901 转义、
+秘密值不回显（200 与 400）、请求对象不被修改、重复 scope 去重等共 440 个用例。
 
 ## 项目结构
 
@@ -1048,7 +1269,7 @@ Callback Object 与 Path Item 本地 `$ref` 解析（多跳、3.1 同级覆盖�
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py          # FastAPI 路由、请求/响应模型、输入校验（/audit、/slice、/compose、/examples/validate、/overlay/apply、/requests/materialize 与 /callbacks/resolve）
+│   ├── main.py          # FastAPI 路由、请求/响应模型、输入校验（/audit、/slice、/compose、/examples/validate、/overlay/apply、/requests/materialize、/callbacks/resolve 与 /security/plan）
 │   ├── audit.py         # 契约比较引擎（操作/参数/请求体/响应/schema）
 │   ├── slicer.py        # 最小子契约切片（选择器校验、security 继承、$ref 闭包重建、SHA-256）
 │   ├── composer.py      # 网关契约合成（前缀规范化、命名空间化、$ref 改写、冲突检测、来源映射）
@@ -1056,6 +1277,7 @@ Callback Object 与 Path Item 本地 `$ref` 解析（多跳、3.1 同级覆盖�
 │   ├── overlay.py       # 有序覆盖动作（受限 JSONPath 解析、命中冻结、递归合并/倒序删除、SHA-256）
 │   ├── materializer.py  # 请求物化（参数合并、循环安全 $ref、path/query/header/cookie 样式序列化、百分号编码）
 │   ├── callbacks.py     # 回调 URL 解析（Runtime Expression、JSON Pointer body 片段、循环安全 Callback/Path Item $ref）
+│   ├── security.py      # 受保护操作鉴权规划（OR/AND security、方案 $ref 循环解析、apiKey/http/oauth2/openIdConnect 校验、注入位置与来源 Pointer）
 │   └── refresolver.py   # 本地 $ref 解析（RFC 6901 指针 + 循环检测）
 ├── tests/
 │   ├── test_audit_api.py
@@ -1064,7 +1286,8 @@ Callback Object 与 Path Item 本地 `$ref` 解析（多跳、3.1 同级覆盖�
 │   ├── test_examples_api.py
 │   ├── test_overlay_api.py
 │   ├── test_materialize_api.py
-│   └── test_callbacks_api.py
+│   ├── test_callbacks_api.py
+│   └── test_security_api.py
 ├── Dockerfile           # 容器封装全部依赖，非 root 用户运行，含 HEALTHCHECK
 ├── docker-compose.yml   # 一条命令启动，映射 8080 端口
 ├── requirements.txt
